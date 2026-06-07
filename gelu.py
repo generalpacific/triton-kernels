@@ -11,7 +11,21 @@ if device == "cuda":
 
 
 """
-E2 — Fused elementwise. Implement y = gelu(x*w + b) as one kernel. Compare to the same expression in eager PyTorch — you should win 3–5×, all from saved memory traffic.
+E2 — Fused elementwise. Implement y = gelu(x*w + b) as one kernel. Compare to the sam expression in eager PyTorch — you should win 3–5×, all from saved memory traffic.
+
+Framing:
+* How many full reads/writes for naive impl for 1d tensor of size N ?
+  * My intuition is for naive pytorch for each operation say x 
+    into w you're reading two vectors, so you're reading two n and 
+    you're writing t1 which is vector vector of size n, so three n. 
+    Similarly for t2 we are writing reading and writing three n. 
+    And for the final, we are reading and writing N, so 2N. 
+    Total 8 N bytes will be read and written, 
+    but if it were a kernel it would be you're reading all three vectors once, 
+    so it's three n and all the calculation happens in the kernel, 
+    so you are writing only n, so total will be four n. 
+    Now taking the ratio of eight n to four n expected speed up is 2x.
+
 """
 @triton.jit
 def gelu(
@@ -31,37 +45,53 @@ def gelu(
     result = 0.5 * v * (1.0 + nv_fast_math.erf(v * 0.70710678118))
     tl.store(result_ptr + block_start + offsets, result, mask=mask)
 
-N = 2**12
-M = 2**12
+N = 2**24
 
-x = torch.rand(N, M, device=device, dtype=torch.float32)
-w = torch.rand(M, device=device, dtype=torch.float32)
+x = torch.rand(N, device=device, dtype=torch.float32)
+w = torch.rand(N, device=device, dtype=torch.float32)
 b = torch.rand(N, device=device, dtype=torch.float32)
 result = torch.empty_like(x)
 
 BLOCK_SIZE = 128
 
+def non_kernel_gelu(x, w, b):
+    v = x * w + b
+    return 0.5 * v * (1.0 + torch.erf(v * 0.70710678118))
+
 def run(block_size):
   gelu[triton.cdiv(N, block_size),](result, x, w, b, N, BLOCK_SIZE=block_size)
-"""
+
+
+run(BLOCK_SIZE)
+v = x * w + b
+non_kernel_result = non_kernel_gelu(x, w, b)
+correct = torch.allclose(result, non_kernel_result)
+print(f"N : {N} correct: {correct})")
+
 for block_size in [32, 64, 128, 256, 512, 1024, 2048, 4096]:
   ms = tt.do_bench(lambda : run(block_size), warmup=100, rep=10, return_mode="mean")
-  bytes_per_sec = 3 * N * 4 / (1e-3 * ms)
+  bytes_per_sec = 4 * N * 4 / (1e-3 * ms)
   gb_per_sec = bytes_per_sec / 1e9
   print(f"My kernel block_size: {block_size}, t: {ms}, gb_oer_secs: {gb_per_sec}")
 
-ms = tt.do_bench(lambda: torch.add(a, b, out=c), return_mode="mean")
-bytes_per_sec = 3 * N * 4 / (1e-3 * ms)
+ms = tt.do_bench(lambda: non_kernel_gelu(x, w, b), return_mode="mean")
+bytes_per_sec = 8 * N * 4 / (1e-3 * ms)
 gb_per_sec = bytes_per_sec / 1e9
 print(f"Torch t: {ms}, gb_per_secs: {gb_per_sec}")
 
 #print(c)
+
 """
-run(BLOCK_SIZE)
-v = x * w + b
-non_kernel_result = 0.5 * v * (1.0 + torch.erf(v * 0.70710678118))
-correct = torch.allclose(result, non_kernel_result)
-print(f"N : {N} correct: {correct})")
+Result: 
+E2 fused gelu(x*w+b) (fp32, N=2²⁴)
+  triton: 924 GB/s        (92% of peak; useful_bytes)
+  torch:  396 GB/s actual (39% of peak; actual 8N moved)
+  → triton ~4.7× faster
+    = 2× (fewer bytes) × 2.35× (better saturation)
+
+"""
+
+
 
 
 
