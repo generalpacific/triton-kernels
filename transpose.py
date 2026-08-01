@@ -65,7 +65,9 @@ def transpose_kernel(
     tile = tl.load(x_ptrs, mask=x_mask)
 
     y_ptrs = y_ptr + offs_n[:, None] * stride_ym + offs_m[None, :] * stride_yn
-    tl.store(y_ptrs, tl.trans(tile), mask=x_mask)
+    y_mask = offs_n[:, None] < N
+    y_mask = y_mask & (offs_m[None, :] < M)
+    tl.store(y_ptrs, tl.trans(tile), mask=y_mask)
     
 
 M, N = 4096, 4096
@@ -94,16 +96,16 @@ def non_kernel_transpose3(x):
     return x.T.clone(memory_format=torch.contiguous_format)
 
 
-def run(block_size):
+def run(block_size_m, block_size_n):
     flush.fill_(0)
-    grid = (triton.cdiv(M, block_size),triton.cdiv(N, block_size))
-    transpose_kernel[grid](x, y, M, N, N, 1, M, 1, BLOCK_M=block_size, BLOCK_N=block_size)
+    grid = (triton.cdiv(M, block_size_m), triton.cdiv(N, block_size_n))
+    transpose_kernel[grid](x, y, M, N, N, 1, M, 1, BLOCK_M=block_size_m, BLOCK_N=block_size_n)
     return y
 
 print(f"x: shape={x.shape}, strides={x.stride()}")
 print(f"y: shape={y.shape}, strides={y.stride()}")
 print(f"original x: {x}")
-kernel_result = run(128)
+kernel_result = run(128, 128)
 print(f"Kernel result: {kernel_result}")
 non_kernel_result = non_kernel_transpose(x)
 print(f"Non-kernel result: {non_kernel_result}")
@@ -111,12 +113,13 @@ correct = torch.allclose(kernel_result, non_kernel_result, atol=1e-5)
 print(f"Correct: {correct}")
 
 
-for block_size in [32, 64, 128, 256]:
-  print(f"Running with block_size: {block_size}")
-  ms = tt.do_bench(lambda : run(block_size), warmup=100, rep=10, return_mode="mean")
-  bytes_per_sec = 2 * M * N * 4 / (1e-3 * ms)
-  gb_per_sec = bytes_per_sec / 1e9
-  print(f"My kernel block_size: {block_size}, t: {ms}, gb_per_secs: {gb_per_sec}, percent of peak: {gb_per_sec / practical_peak * 100:.2f}%")
+for block_size_m in [16, 32, 64, 128, 256]:
+  for block_size_n in [16, 32, 64, 128, 256]:
+    print(f"Running with block_size: {block_size_m} x {block_size_n}")
+    ms = tt.do_bench(lambda : run(block_size_m, block_size_n), warmup=100, rep=10, return_mode="mean")
+    bytes_per_sec = 2 * M * N * 4 / (1e-3 * ms)
+    gb_per_sec = bytes_per_sec / 1e9
+    print(f"My kernel block_size: {block_size_m} x {block_size_n}, t: {ms}, gb_per_secs: {gb_per_sec}, percent of peak: {gb_per_sec / practical_peak * 100:.2f}%")
 
 ms = tt.do_bench(lambda : non_kernel_transpose(x), warmup=100, rep=10, return_mode="mean")
 bytes_per_sec = 2 * M * N * 4 / (1e-3 * ms)
